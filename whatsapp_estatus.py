@@ -103,7 +103,7 @@ COMMAND = _env("WA_COMMAND", "/").lower()
 
 # --- /ine: genera credencial INE consumiendo gen-docs-izzi ---
 GENDOCS_URL = _env("GENDOCS_URL").rstrip("/")          # URL de gen-docs en Koyeb
-GENDOCS_COMMAND = _env("GENDOCS_COMMAND", "/ine").lower()
+GENDOCS_COMMAND = _env("GENDOCS_COMMAND", "/gen").lower()
 GENDOCS_TIMEOUT = float(_env("GENDOCS_TIMEOUT", "180"))  # generar la INE tarda
 
 # --- Resumen final con DeepSeek (opcional) ---
