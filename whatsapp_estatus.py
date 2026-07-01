@@ -703,6 +703,18 @@ async def manejar_ine(texto, to, phone_id, client):
         await wa_send(to, "⚠️ gen-docs no devolvió datos estructurados.", phone_id, client)
         return
 
+    # Si no vino CURP, intenta CALCULARLA del mismo texto (nombre + fecha + lugar de
+    # nacimiento). Así la INE lleva una CURP real y no una ficticia del generador.
+    if not str(datos.get("CURP") or "").strip():
+        try:
+            rc = await client.post(f"{GENDOCS_URL}/curp", json={"texto": datos_texto},
+                                   timeout=GENDOCS_TIMEOUT)
+            jc = rc.json()
+            if rc.status_code < 400 and jc.get("curp"):
+                datos["CURP"] = jc["curp"]
+        except Exception:
+            pass   # sin datos de nacimiento no se puede: el generador pondrá una automática
+
     await _generar_y_enviar(datos, to, phone_id, client)
 
 
