@@ -743,13 +743,17 @@ async def manejar_ine(texto, to, phone_id, client):
     if notas:
         await wa_send(to, "\n".join(notas), phone_id, client)
 
+    # Barre pendientes viejos. Si NO hubo ninguna imagen, no ofrezcas guardar
+    # (guardaríamos una fila con b64 nulos que se vería como "Guardado ✓").
+    now = time.time()
+    for k in [k for k, v in list(_pend_supabase.items()) if now - v["ts"] > PEND_TTL]:
+        _pend_supabase.pop(k, None)
+    if not (b64.get("frente") or b64.get("reverso")):
+        return
     # Deja el resultado pendiente y PREGUNTA si guardar en Supabase (sí/no).
     nombre = " ".join(
         p for p in (str(datos.get(k, "")).strip()
                     for k in ("NOMBRE_1", "NOMBRE_2", "APELLIDO_1", "APELLIDO_2")) if p)
-    now = time.time()
-    for k in [k for k, v in list(_pend_supabase.items()) if now - v["ts"] > PEND_TTL]:
-        _pend_supabase.pop(k, None)                 # barre pendientes viejos
     _pend_supabase[to] = {"ts": now, "nombre": nombre, "json_data": datos,
                           "b64_fronta": b64.get("frente"), "b64_trasera": b64.get("reverso")}
     await wa_send(to, "💾 ¿Guardar esta captura en Supabase? Responde *SÍ* o *NO*.",
@@ -792,7 +796,10 @@ async def procesar(msg: dict, value: dict):
             low = texto.lower()
             # ¿hay un guardado en Supabase esperando confirmación sí/no de este número?
             pend = _pend_supabase.get(to)
-            if pend and (time.time() - pend["ts"] <= PEND_TTL) and low in (_SI | _NO):
+            if pend and time.time() - pend["ts"] > PEND_TTL:
+                _pend_supabase.pop(to, None)          # venció: descártalo y libera los b64
+                pend = None
+            if pend and low in (_SI | _NO):
                 _pend_supabase.pop(to, None)
                 await manejar_confirmacion_supabase(low in _SI, pend, to, phone_id, client)
                 return
@@ -954,7 +961,12 @@ async def webhook(request: Request):
                         t = asyncio.create_task(procesar({"from": wa_id, "text": {"body": ""}}, value))
                         _TAREAS.add(t); t.add_done_callback(_TAREAS.discard)
                     continue
-                if wa_id in _inflight:
+                _resp = ((msg.get("text") or {}).get("body") or "").strip().lower()
+                if _resp in (_SI | _NO) and wa_id in _pend_supabase:
+                    # Confirmación sí/no de un guardado pendiente: es barata y NO debe
+                    # bloquearse por inflight/rate-limit (si no, se perdería la respuesta).
+                    t = asyncio.create_task(procesar(msg, value))
+                elif wa_id in _inflight:
                     t = asyncio.create_task(_avisar(wa_id, value, "⏳ Ya tengo una consulta tuya en curso, espera a que termine."))
                 elif not rate_ok(wa_id):
                     t = asyncio.create_task(_avisar(wa_id, value, "🚦 Vas muy rápido. Espera unos minutos e intenta de nuevo."))
