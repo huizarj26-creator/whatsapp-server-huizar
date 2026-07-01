@@ -83,8 +83,11 @@ ESTATUS_DIR = _env("ESTATUS_DIR", r"C:\proyects\CHECAR ESTATUS")
 ESTATUS_EMBEDDED_FORCE = _env("ESTATUS_EMBEDDED_FORCE", "0") == "1"
 
 # --- Operación ---
-PORT = int(_env("WA_PORT", "8788"))
-HOST = _env("WA_HOST", "127.0.0.1")
+# En la nube (Koyeb/Render/Railway…) la plataforma inyecta $PORT y hay que
+# escuchar en 0.0.0.0. En local se mantienen los defaults de siempre.
+_IN_CLOUD = bool(_env("PORT"))
+PORT = int(_env("PORT") or _env("WA_PORT", "8788"))
+HOST = _env("WA_HOST", "0.0.0.0" if _IN_CLOUD else "127.0.0.1")
 MAX_CUENTAS = int(_env("WA_MAX_CUENTAS", "50"))
 CHUNK = int(_env("WA_CHUNK", "3900"))                  # tope WhatsApp = 4096
 API_TIMEOUT = float(_env("WA_API_TIMEOUT", "180"))     # Siebel puede tardar

@@ -1,0 +1,9 @@
+# No meter secretos ni basura al build/imagen.
+.env
+_estado/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.bat
+cloudflared-wa.yml
