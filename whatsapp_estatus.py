@@ -789,7 +789,11 @@ async def manejar_curp(texto, to, phone_id, client):
         await wa_send(to, f"⚠️ Error llamando a gen-docs (/curp): {str(ex)[:120]}", phone_id, client)
         return
     if r.status_code >= 400 or not j.get("curp"):
-        await wa_send(to, f"⚠️ No pude calcular la CURP: {j.get('error') or ('HTTP ' + str(r.status_code))}",
+        await wa_send(to, "⚠️ No pude calcular la CURP: "
+                          f"{j.get('error') or ('HTTP ' + str(r.status_code))}\n\n"
+                          "Para la CURP necesito, además del nombre y apellidos: *sexo*, "
+                          "*fecha de nacimiento* (ej. 1985-03-15) y *estado de nacimiento*.\n"
+                          f"Ej: {CURP_COMMAND} Juan Perez Lopez, hombre, 1985-03-15, Jalisco",
                       phone_id, client)
         return
     d = j.get("datos") or {}
@@ -818,6 +822,9 @@ async def manejar_pendiente(texto, low, pend, to, phone_id, client):
     if not GENDOCS_URL:
         await wa_send(to, "⚠️ Falta configurar GENDOCS_URL para editar.", phone_id, client)
         return
+    # Invalida YA el pendiente viejo: mientras regenera, un "subir" no debe guardar los
+    # datos SIN editar. Se recrea con los datos nuevos si la regeneración funciona.
+    _pend_supabase.pop(to, None)
     await wa_send(to, "✏️ Aplicando el cambio y regenerando…", phone_id, client)
     try:
         r = await client.post(f"{GENDOCS_URL}/editar",
@@ -828,11 +835,14 @@ async def manejar_pendiente(texto, low, pend, to, phone_id, client):
         except Exception:
             j = {}
     except httpx.HTTPError as ex:
-        await wa_send(to, f"⚠️ Error al editar: {str(ex)[:120]}", phone_id, client)
+        _pend_supabase[to] = {**pend, "ts": time.time()}   # restaura: no perder la captura
+        await wa_send(to, f"⚠️ Error al editar (tu captura anterior sigue pendiente): {str(ex)[:120]}",
+                      phone_id, client)
         return
     if r.status_code >= 400 or not j.get("datos"):
-        await wa_send(to, f"⚠️ No pude editar: {j.get('error') or ('HTTP ' + str(r.status_code))}",
-                      phone_id, client)
+        _pend_supabase[to] = {**pend, "ts": time.time()}
+        await wa_send(to, "⚠️ No pude editar (tu captura anterior sigue pendiente): "
+                          f"{j.get('error') or ('HTTP ' + str(r.status_code))}", phone_id, client)
         return
     await _generar_y_enviar(j["datos"], to, phone_id, client, encabezado="🔁 *JSON actualizado*")
 
@@ -1038,9 +1048,10 @@ async def webhook(request: Request):
                         _TAREAS.add(t); t.add_done_callback(_TAREAS.discard)
                     continue
                 _resp = ((msg.get("text") or {}).get("body") or "").strip().lower()
-                if _resp in (_SUBIR | _NO) and wa_id in _pend_supabase:
-                    # subir/no de una captura pendiente: es barato y NO debe bloquearse
-                    # por inflight/rate-limit (una edición sí pasa por el flujo normal).
+                if _resp in (_SUBIR | _NO) and wa_id in _pend_supabase and wa_id not in _inflight:
+                    # subir/no de una captura pendiente y SIN nada en curso: barato, sin
+                    # rate-limit. Si hay algo corriendo (p.ej. una edición), cae al aviso
+                    # normal de "en curso" para no guardar datos a medio regenerar.
                     t = asyncio.create_task(procesar(msg, value))
                 elif wa_id in _inflight:
                     t = asyncio.create_task(_avisar(wa_id, value, "⏳ Ya tengo una consulta tuya en curso, espera a que termine."))
