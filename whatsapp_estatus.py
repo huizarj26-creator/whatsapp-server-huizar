@@ -104,6 +104,7 @@ COMMAND = _env("WA_COMMAND", "/").lower()
 # --- /ine: genera credencial INE consumiendo gen-docs-izzi ---
 GENDOCS_URL = _env("GENDOCS_URL").rstrip("/")          # URL de gen-docs en Koyeb
 GENDOCS_COMMAND = _env("GENDOCS_COMMAND", "/gen").lower()
+CURP_COMMAND = _env("CURP_COMMAND", "/curp").lower()     # calcular CURP
 GENDOCS_TIMEOUT = float(_env("GENDOCS_TIMEOUT", "180"))  # generar la INE tarda
 
 # --- Resumen final con DeepSeek (opcional) ---
@@ -176,8 +177,12 @@ _rl_calls = 0
 # wa_id -> {ts, nombre, json_data, b64_fronta, b64_trasera}
 _pend_supabase = {}
 PEND_TTL = float(_env("WA_PEND_TTL", "1800"))          # 30 min para confirmar
-_SI = {"si", "sí", "s", "yes", "y", "1", "ok", "dale", "guardar", "guarda"}
-_NO = {"no", "n", "0", "nel", "cancelar", "cancela"}
+_SUBIR = {"subir", "sube", "guardar", "guarda", "si", "sí", "s", "ok", "dale", "yes", "y", "1"}
+_NO = {"no", "n", "0", "nel", "cancelar", "cancela", "descartar", "descarta"}
+_PREGUNTA_PEND = ("💾 ¿Qué hago con esta captura?\n"
+                  "• *subir* → guardar en Supabase\n"
+                  "• *no* → descartar\n"
+                  "• o dime qué *editar* (ej: «cambia el nombre a JUAN», «CP 64000») y la regenero.")
 
 
 def rate_ok(wa_id: str) -> bool:
@@ -428,7 +433,10 @@ AYUDA = ("👋 Mándame  /  seguido de las cuentas (8 dígitos). Ejemplo:\n"
          f"{COMMAND}52783460 52784100\n"
          "y te devuelvo estatus, OS y últimos casos.\n\n"
          f"🪪 Para generar una INE: {GENDOCS_COMMAND} <datos del cliente>\n"
-         f"Ej: {GENDOCS_COMMAND} Juan Perez Lopez, CURP PELJ850101HDFRXN09, CDMX, CP 06600")
+         f"Ej: {GENDOCS_COMMAND} Juan Perez Lopez, CURP PELJ850101HDFRXN09, CDMX, CP 06600\n"
+         "(luego te pregunto: subir a Supabase, o dime qué editar y la regenero)\n\n"
+         f"🔢 Para calcular una CURP: {CURP_COMMAND} <nombre, sexo, fecha y lugar de nacimiento>\n"
+         f"Ej: {CURP_COMMAND} Ana Lopez Soto, mujer, 1999-02-28, Jalisco")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -695,14 +703,19 @@ async def manejar_ine(texto, to, phone_id, client):
         await wa_send(to, "⚠️ gen-docs no devolvió datos estructurados.", phone_id, client)
         return
 
-    # Manda el JSON (solo los campos con valor, legible)
+    await _generar_y_enviar(datos, to, phone_id, client)
+
+
+async def _generar_y_enviar(datos, to, phone_id, client, encabezado="📋 *Datos estructurados*"):
+    """Manda el JSON, genera y manda la INE (frente+reverso), deja el resultado
+    pendiente y PREGUNTA (subir / editar / no). Lo reutilizan /gen y las ediciones."""
     lleno = {k: v for k, v in datos.items() if str(v).strip()}
     js = json.dumps(lleno, ensure_ascii=False, indent=2)
-    for ch in construir_chunks(["📋 *Datos estructurados*\n```\n" + js + "\n```"]):
+    for ch in construir_chunks([f"{encabezado}\n```\n" + js + "\n```"]):
         await wa_send(to, ch, phone_id, client)
         await asyncio.sleep(0.4)
 
-    # 2) JSON -> imágenes INE (frente + reverso)
+    # JSON -> imágenes INE (frente + reverso)
     try:
         r = await client.post(f"{GENDOCS_URL}/generar-todo", json=datos, timeout=GENDOCS_TIMEOUT)
         if r.status_code >= 400:
@@ -714,8 +727,6 @@ async def manejar_ine(texto, to, phone_id, client):
         return
 
     b64 = out.get("documentos_b64") or {}
-    if not b64:
-        await wa_send(to, "⚠️ gen-docs no devolvió imágenes.", phone_id, client)
     for nombre in ("frente", "reverso"):
         if nombre not in b64:
             continue
@@ -732,7 +743,6 @@ async def manejar_ine(texto, to, phone_id, client):
         else:
             await wa_send(to, f"⚠️ No pude subir la imagen '{nombre}' a WhatsApp.", phone_id, client)
 
-    # Notas finales: CURP usada, avisos y errores del generador
     notas = []
     if out.get("curp"):
         notas.append(f"CURP usada: {out['curp']}")
@@ -743,29 +753,92 @@ async def manejar_ine(texto, to, phone_id, client):
     if notas:
         await wa_send(to, "\n".join(notas), phone_id, client)
 
-    # Barre pendientes viejos. Si NO hubo ninguna imagen, no ofrezcas guardar
-    # (guardaríamos una fila con b64 nulos que se vería como "Guardado ✓").
+    # Barre pendientes viejos. Sin imágenes no dejamos nada pendiente.
     now = time.time()
     for k in [k for k, v in list(_pend_supabase.items()) if now - v["ts"] > PEND_TTL]:
         _pend_supabase.pop(k, None)
     if not (b64.get("frente") or b64.get("reverso")):
+        await wa_send(to, "⚠️ No se generaron imágenes; no dejo nada pendiente.", phone_id, client)
         return
-    # Deja el resultado pendiente y PREGUNTA si guardar en Supabase (sí/no).
     nombre = " ".join(
         p for p in (str(datos.get(k, "")).strip()
                     for k in ("NOMBRE_1", "NOMBRE_2", "APELLIDO_1", "APELLIDO_2")) if p)
     _pend_supabase[to] = {"ts": now, "nombre": nombre, "json_data": datos,
                           "b64_fronta": b64.get("frente"), "b64_trasera": b64.get("reverso")}
-    await wa_send(to, "💾 ¿Guardar esta captura en Supabase? Responde *SÍ* o *NO*.",
-                  phone_id, client)
+    await wa_send(to, _PREGUNTA_PEND, phone_id, client)
 
 
-async def manejar_confirmacion_supabase(guardar, pend, to, phone_id, client):
-    """Respuesta sí/no al '¿guardar en Supabase?'. En 'sí' llama a gen-docs /guardar
-    con lo YA generado (no regenera). En 'no' descarta."""
-    if not guardar:
-        await wa_send(to, "👍 Ok, no guardé nada en Supabase.", phone_id, client)
+async def manejar_curp(texto, to, phone_id, client):
+    """/curp <datos> -> calcula la CURP (gen-docs /curp, estructura el texto con DeepSeek)."""
+    if not GENDOCS_URL:
+        await wa_send(to, "⚠️ Falta configurar GENDOCS_URL.", phone_id, client)
         return
+    datos_texto = texto[len(CURP_COMMAND):].strip()
+    if not datos_texto:
+        await wa_send(to, f"Uso: {CURP_COMMAND} <nombre completo, sexo, fecha y lugar de nacimiento>\n"
+                          f"Ej: {CURP_COMMAND} Juan Perez Lopez, hombre, 1985-01-01, CDMX",
+                      phone_id, client)
+        return
+    try:
+        r = await client.post(f"{GENDOCS_URL}/curp", json={"texto": datos_texto}, timeout=GENDOCS_TIMEOUT)
+        try:
+            j = r.json()
+        except Exception:
+            j = {}
+    except httpx.HTTPError as ex:
+        await wa_send(to, f"⚠️ Error llamando a gen-docs (/curp): {str(ex)[:120]}", phone_id, client)
+        return
+    if r.status_code >= 400 or not j.get("curp"):
+        await wa_send(to, f"⚠️ No pude calcular la CURP: {j.get('error') or ('HTTP ' + str(r.status_code))}",
+                      phone_id, client)
+        return
+    d = j.get("datos") or {}
+    nombre = " ".join(x for x in [d.get("NOMBRE_1", ""), d.get("NOMBRE_2", ""),
+                                  d.get("APELLIDO_1", ""), d.get("APELLIDO_2", "")] if x).strip()
+    msg = f"🪪 *CURP*: {j['curp']}"
+    if nombre:
+        msg += f"\n{nombre}"
+    adv = j.get("advertencias") or []
+    if adv:
+        msg += "\n\n⚠️ " + "\n⚠️ ".join(str(a) for a in adv)
+    await wa_send(to, msg, phone_id, client)
+
+
+async def manejar_pendiente(texto, low, pend, to, phone_id, client):
+    """Respuesta a la pregunta subir/editar/no de una captura pendiente."""
+    if low in _SUBIR:
+        _pend_supabase.pop(to, None)
+        await _guardar_pendiente(pend, to, phone_id, client)
+        return
+    if low in _NO:
+        _pend_supabase.pop(to, None)
+        await wa_send(to, "👍 Ok, descarté esta captura (no se guardó).", phone_id, client)
+        return
+    # Cualquier otra cosa = instrucción de edición para el agente DeepSeek de gen-docs.
+    if not GENDOCS_URL:
+        await wa_send(to, "⚠️ Falta configurar GENDOCS_URL para editar.", phone_id, client)
+        return
+    await wa_send(to, "✏️ Aplicando el cambio y regenerando…", phone_id, client)
+    try:
+        r = await client.post(f"{GENDOCS_URL}/editar",
+                              json={"json_data": pend.get("json_data"), "instruccion": texto},
+                              timeout=GENDOCS_TIMEOUT)
+        try:
+            j = r.json()
+        except Exception:
+            j = {}
+    except httpx.HTTPError as ex:
+        await wa_send(to, f"⚠️ Error al editar: {str(ex)[:120]}", phone_id, client)
+        return
+    if r.status_code >= 400 or not j.get("datos"):
+        await wa_send(to, f"⚠️ No pude editar: {j.get('error') or ('HTTP ' + str(r.status_code))}",
+                      phone_id, client)
+        return
+    await _generar_y_enviar(j["datos"], to, phone_id, client, encabezado="🔁 *JSON actualizado*")
+
+
+async def _guardar_pendiente(pend, to, phone_id, client):
+    """Sube a Supabase la captura pendiente (gen-docs /guardar), sin regenerar."""
     if not GENDOCS_URL:
         await wa_send(to, "⚠️ Falta configurar GENDOCS_URL para poder guardar.", phone_id, client)
         return
@@ -794,20 +867,23 @@ async def procesar(msg: dict, value: dict):
     async with httpx.AsyncClient() as client:
         try:
             low = texto.lower()
-            # ¿hay un guardado en Supabase esperando confirmación sí/no de este número?
+            # ¿hay una captura pendiente (tras /gen) esperando subir/editar/no?
             pend = _pend_supabase.get(to)
             if pend and time.time() - pend["ts"] > PEND_TTL:
                 _pend_supabase.pop(to, None)          # venció: descártalo y libera los b64
                 pend = None
-            if pend and low in (_SI | _NO):
-                _pend_supabase.pop(to, None)
-                await manejar_confirmacion_supabase(low in _SI, pend, to, phone_id, client)
+            if pend and not low.startswith("/"):
+                # Cualquier texto que NO sea comando = subir / no / instrucción de edición.
+                await manejar_pendiente(texto, low, pend, to, phone_id, client)
                 return
             if low.startswith(REPROG_COMMAND):
                 await manejar_reprogramar(texto, to, phone_id, client)
                 return
             if low.startswith(GENDOCS_COMMAND):
                 await manejar_ine(texto, to, phone_id, client)
+                return
+            if low.startswith(CURP_COMMAND):
+                await manejar_curp(texto, to, phone_id, client)
                 return
             if not low.startswith(COMMAND):
                 await wa_send(to, AYUDA, phone_id, client)
@@ -962,9 +1038,9 @@ async def webhook(request: Request):
                         _TAREAS.add(t); t.add_done_callback(_TAREAS.discard)
                     continue
                 _resp = ((msg.get("text") or {}).get("body") or "").strip().lower()
-                if _resp in (_SI | _NO) and wa_id in _pend_supabase:
-                    # Confirmación sí/no de un guardado pendiente: es barata y NO debe
-                    # bloquearse por inflight/rate-limit (si no, se perdería la respuesta).
+                if _resp in (_SUBIR | _NO) and wa_id in _pend_supabase:
+                    # subir/no de una captura pendiente: es barato y NO debe bloquearse
+                    # por inflight/rate-limit (una edición sí pasa por el flujo normal).
                     t = asyncio.create_task(procesar(msg, value))
                 elif wa_id in _inflight:
                     t = asyncio.create_task(_avisar(wa_id, value, "⏳ Ya tengo una consulta tuya en curso, espera a que termine."))
