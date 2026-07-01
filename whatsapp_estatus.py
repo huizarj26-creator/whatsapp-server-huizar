@@ -172,6 +172,13 @@ _rl = defaultdict(list)
 _inflight = set()
 _rl_calls = 0
 
+# Guardado en Supabase pendiente de confirmar (/gen -> "¿guardar? sí/no")
+# wa_id -> {ts, nombre, json_data, b64_fronta, b64_trasera}
+_pend_supabase = {}
+PEND_TTL = float(_env("WA_PEND_TTL", "1800"))          # 30 min para confirmar
+_SI = {"si", "sí", "s", "yes", "y", "1", "ok", "dale", "guardar", "guarda"}
+_NO = {"no", "n", "0", "nel", "cancelar", "cancela"}
+
 
 def rate_ok(wa_id: str) -> bool:
     global _rl_calls
@@ -736,6 +743,44 @@ async def manejar_ine(texto, to, phone_id, client):
     if notas:
         await wa_send(to, "\n".join(notas), phone_id, client)
 
+    # Deja el resultado pendiente y PREGUNTA si guardar en Supabase (sí/no).
+    nombre = " ".join(
+        p for p in (str(datos.get(k, "")).strip()
+                    for k in ("NOMBRE_1", "NOMBRE_2", "APELLIDO_1", "APELLIDO_2")) if p)
+    now = time.time()
+    for k in [k for k, v in list(_pend_supabase.items()) if now - v["ts"] > PEND_TTL]:
+        _pend_supabase.pop(k, None)                 # barre pendientes viejos
+    _pend_supabase[to] = {"ts": now, "nombre": nombre, "json_data": datos,
+                          "b64_fronta": b64.get("frente"), "b64_trasera": b64.get("reverso")}
+    await wa_send(to, "💾 ¿Guardar esta captura en Supabase? Responde *SÍ* o *NO*.",
+                  phone_id, client)
+
+
+async def manejar_confirmacion_supabase(guardar, pend, to, phone_id, client):
+    """Respuesta sí/no al '¿guardar en Supabase?'. En 'sí' llama a gen-docs /guardar
+    con lo YA generado (no regenera). En 'no' descarta."""
+    if not guardar:
+        await wa_send(to, "👍 Ok, no guardé nada en Supabase.", phone_id, client)
+        return
+    if not GENDOCS_URL:
+        await wa_send(to, "⚠️ Falta configurar GENDOCS_URL para poder guardar.", phone_id, client)
+        return
+    payload = {"nombre_completp": pend.get("nombre"), "json_data": pend.get("json_data"),
+               "b64_fronta": pend.get("b64_fronta"), "b64_trasera": pend.get("b64_trasera")}
+    try:
+        r = await client.post(f"{GENDOCS_URL}/guardar", json=payload, timeout=GENDOCS_TIMEOUT)
+        try:
+            j = r.json()
+        except Exception:
+            j = {}
+        if r.status_code < 400 and j.get("ok"):
+            await wa_send(to, f"✅ Guardado en Supabase (id {j.get('id')}).", phone_id, client)
+        else:
+            await wa_send(to, f"⚠️ No se guardó: {j.get('error') or ('HTTP ' + str(r.status_code))}",
+                          phone_id, client)
+    except httpx.HTTPError as ex:
+        await wa_send(to, f"⚠️ Error guardando en Supabase: {str(ex)[:120]}", phone_id, client)
+
 
 async def procesar(msg: dict, value: dict):
     """Tarea en segundo plano: consulta y responde. Nunca debe lanzar excepción."""
@@ -745,6 +790,12 @@ async def procesar(msg: dict, value: dict):
     async with httpx.AsyncClient() as client:
         try:
             low = texto.lower()
+            # ¿hay un guardado en Supabase esperando confirmación sí/no de este número?
+            pend = _pend_supabase.get(to)
+            if pend and (time.time() - pend["ts"] <= PEND_TTL) and low in (_SI | _NO):
+                _pend_supabase.pop(to, None)
+                await manejar_confirmacion_supabase(low in _SI, pend, to, phone_id, client)
+                return
             if low.startswith(REPROG_COMMAND):
                 await manejar_reprogramar(texto, to, phone_id, client)
                 return
