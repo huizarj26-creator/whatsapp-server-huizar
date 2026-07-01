@@ -1,0 +1,4 @@
+.env
+_estado/
+__pycache__/
+*.pyc

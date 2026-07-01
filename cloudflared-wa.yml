@@ -1,0 +1,13 @@
+# Reusa el túnel YA autenticado 'estatus-idocrm' (cuenta Cloudflare de idocrm.es)
+# y publica el webhook del bot en wa.idocrm.es -> 127.0.0.1:8788.
+# Incluye también estatus.idocrm.es para no perder ese acceso al usar este config.
+# Correr:  cloudflared tunnel --config "...\cloudflared-wa.yml" run estatus-idocrm
+tunnel: estatus-idocrm
+credentials-file: C:\Users\jvrhz\.cloudflared\d8be21f7-abb0-40a4-9e1b-785eebac9304.json
+
+ingress:
+  - hostname: wa.idocrm.es
+    service: http://127.0.0.1:8788
+  - hostname: estatus.idocrm.es
+    service: http://127.0.0.1:8787
+  - service: http_status:404
