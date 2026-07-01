@@ -28,6 +28,7 @@ Config: archivo .env en esta carpeta (ver .env de ejemplo).
 """
 import argparse
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -99,6 +100,11 @@ SEEN_TTL = float(_env("WA_SEEN_TTL", "7200"))          # 2 h: ventana de reinten
 RL_MAX = int(_env("WA_RATE_MAX", "6"))                 # consultas por remitente
 RL_WIN = float(_env("WA_RATE_WIN", "600"))             # ...en esta ventana (s)
 COMMAND = _env("WA_COMMAND", "/").lower()
+
+# --- /ine: genera credencial INE consumiendo gen-docs-izzi ---
+GENDOCS_URL = _env("GENDOCS_URL").rstrip("/")          # URL de gen-docs en Koyeb
+GENDOCS_COMMAND = _env("GENDOCS_COMMAND", "/ine").lower()
+GENDOCS_TIMEOUT = float(_env("GENDOCS_TIMEOUT", "180"))  # generar la INE tarda
 
 # --- Resumen final con DeepSeek (opcional) ---
 DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY")
@@ -413,7 +419,9 @@ def parsear_cuentas(texto: str):
 
 AYUDA = ("👋 Mándame  /  seguido de las cuentas (8 dígitos). Ejemplo:\n"
          f"{COMMAND}52783460 52784100\n"
-         "y te devuelvo estatus, OS y últimos casos.")
+         "y te devuelvo estatus, OS y últimos casos.\n\n"
+         f"🪪 Para generar una INE: {GENDOCS_COMMAND} <datos del cliente>\n"
+         f"Ej: {GENDOCS_COMMAND} Juan Perez Lopez, CURP PELJ850101HDFRXN09, CDMX, CP 06600")
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -436,6 +444,50 @@ async def wa_send(to: str, body: str, phone_id: str, client: httpx.AsyncClient) 
     if r.status_code >= 400:
         # 131047 = fuera de la ventana de 24h (requiere plantilla); no reintentar.
         log.error("envío WhatsApp %s: %s", r.status_code, r.text[:300])
+        return False
+    return True
+
+
+async def wa_upload_media(data: bytes, mime: str, phone_id: str, client: httpx.AsyncClient) -> str:
+    """Sube una imagen a Meta (endpoint /media) y devuelve el media_id (o "" si falla)."""
+    if not (ACCESS_TOKEN and phone_id and data):
+        return ""
+    ext = "png" if mime == "image/png" else "jpg"
+    url = f"{GRAPH_BASE}/{phone_id}/media"
+    files = {"file": (f"ine.{ext}", data, mime)}
+    form = {"messaging_product": "whatsapp", "type": mime}
+    try:
+        r = await client.post(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                              data=form, files=files, timeout=60)
+    except httpx.HTTPError as ex:
+        log.error("subida de media falló (red): %s", str(ex)[:120])
+        return ""
+    if r.status_code >= 400:
+        log.error("subida de media %s: %s", r.status_code, r.text[:300])
+        return ""
+    return (r.json() or {}).get("id", "")
+
+
+async def wa_send_image(to: str, media_id: str, phone_id: str, client: httpx.AsyncClient,
+                        caption: str = "") -> bool:
+    """Manda una imagen ya subida (por media_id) al destinatario."""
+    if not (ACCESS_TOKEN and phone_id and media_id):
+        return False
+    url = f"{GRAPH_BASE}/{phone_id}/messages"
+    img = {"id": media_id}
+    if caption:
+        img["caption"] = caption[:1024]
+    payload = {"messaging_product": "whatsapp", "recipient_type": "individual",
+               "to": to, "type": "image", "image": img}
+    try:
+        r = await client.post(url, headers={"Authorization": f"Bearer {ACCESS_TOKEN}",
+                                            "Content-Type": "application/json"},
+                             json=payload, timeout=30)
+    except httpx.HTTPError as ex:
+        log.error("envío de imagen falló (red): %s", str(ex)[:120])
+        return False
+    if r.status_code >= 400:
+        log.error("envío de imagen %s: %s", r.status_code, r.text[:300])
         return False
     return True
 
@@ -605,6 +657,86 @@ async def manejar_reprogramar(texto, to, phone_id, client):
         await wa_send(to, f"❌ No se creó · cuenta {cuenta}: {str(ex)[:120]}", phone_id, client)
 
 
+async def manejar_ine(texto, to, phone_id, client):
+    """/ine <datos libres> -> gen-docs /parsear (texto→JSON) y luego /generar-todo
+    (JSON→INE frente+reverso). Manda primero el JSON y después las 2 imágenes."""
+    if not GENDOCS_URL:
+        await wa_send(to, "⚠️ Falta configurar GENDOCS_URL (URL de gen-docs en Koyeb).", phone_id, client)
+        return
+    datos_texto = texto[len(GENDOCS_COMMAND):].strip()
+    if not datos_texto:
+        await wa_send(to, f"Uso: {GENDOCS_COMMAND} <datos del cliente>\n"
+                          "Ej: Juan Perez Lopez, CURP PELJ850101HDFRXN09, tel 5512345678, "
+                          "Av. Reforma 222 int 4B, col Juarez, Cuauhtemoc, CDMX, CP 06600",
+                      phone_id, client)
+        return
+
+    await wa_send(to, "🪪 Procesando… te mando el JSON y luego la INE (puede tardar ~1 min).",
+                  phone_id, client)
+
+    # 1) Texto libre -> JSON estructurado (DeepSeek en gen-docs)
+    try:
+        r = await client.post(f"{GENDOCS_URL}/parsear", json={"texto": datos_texto}, timeout=GENDOCS_TIMEOUT)
+        if r.status_code >= 400:
+            await wa_send(to, f"⚠️ No pude estructurar los datos (HTTP {r.status_code}).\n{r.text[:200]}", phone_id, client)
+            return
+        datos = (r.json() or {}).get("datos") or {}
+    except httpx.HTTPError as ex:
+        await wa_send(to, f"⚠️ Error llamando a gen-docs (/parsear): {str(ex)[:120]}", phone_id, client)
+        return
+    if not datos:
+        await wa_send(to, "⚠️ gen-docs no devolvió datos estructurados.", phone_id, client)
+        return
+
+    # Manda el JSON (solo los campos con valor, legible)
+    lleno = {k: v for k, v in datos.items() if str(v).strip()}
+    js = json.dumps(lleno, ensure_ascii=False, indent=2)
+    for ch in construir_chunks(["📋 *Datos estructurados*\n```\n" + js + "\n```"]):
+        await wa_send(to, ch, phone_id, client)
+        await asyncio.sleep(0.4)
+
+    # 2) JSON -> imágenes INE (frente + reverso)
+    try:
+        r = await client.post(f"{GENDOCS_URL}/generar-todo", json=datos, timeout=GENDOCS_TIMEOUT)
+        if r.status_code >= 400:
+            await wa_send(to, f"⚠️ No pude generar la INE (HTTP {r.status_code}).\n{r.text[:200]}", phone_id, client)
+            return
+        out = r.json() or {}
+    except httpx.HTTPError as ex:
+        await wa_send(to, f"⚠️ Error llamando a gen-docs (/generar-todo): {str(ex)[:120]}", phone_id, client)
+        return
+
+    b64 = out.get("documentos_b64") or {}
+    if not b64:
+        await wa_send(to, "⚠️ gen-docs no devolvió imágenes.", phone_id, client)
+    for nombre in ("frente", "reverso"):
+        if nombre not in b64:
+            continue
+        try:
+            data = base64.b64decode(b64[nombre])
+        except Exception:
+            await wa_send(to, f"⚠️ Imagen '{nombre}' corrupta.", phone_id, client)
+            continue
+        mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+        mid = await wa_upload_media(data, mime, phone_id, client)
+        if mid:
+            await wa_send_image(to, mid, phone_id, client, caption=f"INE {nombre}")
+            await asyncio.sleep(0.4)
+        else:
+            await wa_send(to, f"⚠️ No pude subir la imagen '{nombre}' a WhatsApp.", phone_id, client)
+
+    # Notas finales: CURP usada, avisos y errores del generador
+    notas = []
+    if out.get("curp"):
+        notas.append(f"CURP usada: {out['curp']}")
+    if out.get("advertencias"):
+        notas.append("Avisos: " + "; ".join(str(a) for a in out["advertencias"]))
+    if out.get("errores"):
+        notas.append("Errores: " + json.dumps(out["errores"], ensure_ascii=False)[:300])
+    if notas:
+        await wa_send(to, "\n".join(notas), phone_id, client)
+
+
 async def procesar(msg: dict, value: dict):
     """Tarea en segundo plano: consulta y responde. Nunca debe lanzar excepción."""
     to = msg.get("from", "")
@@ -615,6 +747,9 @@ async def procesar(msg: dict, value: dict):
             low = texto.lower()
             if low.startswith(REPROG_COMMAND):
                 await manejar_reprogramar(texto, to, phone_id, client)
+                return
+            if low.startswith(GENDOCS_COMMAND):
+                await manejar_ine(texto, to, phone_id, client)
                 return
             if not low.startswith(COMMAND):
                 await wa_send(to, AYUDA, phone_id, client)
